@@ -530,6 +530,8 @@ JS_FIND_LIVE = r"""
             cls: String(box.className).slice(0, 120)};
   };
   // 진행 중인 라이브는 밴드 홈의 전용 영역에 카드로 뜬다(없을 땐 빈 div). 2026-10-11 실제 화면에서 확인
+  const card = [...document.querySelectorAll('[data-viewname="DLiveCardView"]')].find(vis);
+  if (card) return mark(card.querySelector('.liveVideo') || card.querySelector('.videoArea') || card, 'card');
   const region = [...document.querySelectorAll('._groupBandLiveCardRegion,._pageBandLiveCardRegion')]
     .find(r => r.children.length && vis(r));
   if (region) return mark(region.querySelector('a,button,[role="button"]') || region.firstElementChild, 'card');
@@ -559,7 +561,7 @@ JS_VIDEO = r"""
   const endBox = [...document.querySelectorAll('.liveMessageBox,._liveMessage,.liveState.-finished')]
     .some(e => shown(e) && /종료/.test(e.textContent || ''));
   const base = {url: location.href, n: vs.length,
-                endText: endBox || /(라이브|방송)[^\n]{0,20}(종료|끝났)|종료된\s*(라이브|방송|LIVE)|(live|broadcast)[^\n]{0,20}ended/i.test(text)};
+                endText: endBox || /(라이브|방송)[^\n]{0,10}(종료되었|종료됐|끝났습니다)|종료된\s*(라이브|방송|LIVE)|(live|broadcast) (has |is )?ended/i.test(text)};
   // 라이브 화면이 아닌 곳(밴드 홈 피드의 지난 방송 등)의 영상은 절대 틀지 않는다 — 재생한 멤버로 남는다
   if (!/\/live\/\d+/.test(location.pathname)) return base;
   if (!vs.length) {
@@ -574,6 +576,11 @@ JS_VIDEO = r"""
                               muted: v.muted, w: v.clientWidth, h: v.clientHeight});
 })()
 """ % JS_TEXT
+
+JS_VIEWER_COUNT = r"""
+(() => { const e = document.querySelector('[data-viewname="DLiveViewerCountView"]');
+  const m = e && (e.textContent || '').match(/\d[\d,]*/); return m ? m[0].replace(/,/g, '') : null; })()
+"""
 
 JS_MY_BANDS = r"""
 (() => [...document.querySelectorAll('a[href*="/band/"]')].map(a => ({
@@ -716,7 +723,8 @@ class Band:
                 t.goto(self.home_url())
                 ids, read = [], False
             if ids:
-                return {"how": "api", "href": "https://www.band.us/band/%s/live/%s" % (load_cfg()["band_no"], ids[0])}
+                return {"how": "api", "api_read": True,
+                        "href": "https://www.band.us/band/%s/live/%s" % (load_cfg()["band_no"], ids[0])}
             found = t.js(JS_FIND_LIVE) or {}
             found["api_read"] = read
             return found
@@ -791,29 +799,20 @@ class Band:
 
     def registered(self):
         """서버가 시청 등록을 받아 줬는지: True / False / None(확인 못 함)"""
-        v = getattr(self, "entered", {}).get("view_live")
+        e = getattr(self, "entered", {})
+        v = e.get("view_live") or e.get("get_live")
         return None if v is None else v.get("code") == 1
 
     def viewers(self):
-        """지금 시청 중인 멤버 명단을 읽어 본다(시청자 수 표시를 눌러 화면이 명단을 받아 오게 한다).
-        (시청자 수, 이름 목록) — 권한이 없거나 화면이 다르면 (None, [])."""
-        click = ("(() => { const e = document.querySelector('[data-viewname=\"DLiveViewerCountView\"]');"
-                 " if (!e) return false; (e.querySelector('a,button') || e).click(); return true; })()")
+        """지금 시청자 수. 라이브 화면 머리의 시청자 수 표시(DLiveViewerCountView)를 읽기만 한다.
+        누르면 명단 창이 화면 위에 떠서 남으므로 누르지 않는다. (시청자 수 또는 None, [])"""
         try:
             with self.b.tab(prefer="/live/") as t:
-                res = self._sniff(t, ["get_live_viewing_members", "get_live_viewer_count"], 6, click_js=click)
+                n = t.js(JS_VIEWER_COUNT)
         except Exception as e:
-            log("시청자 명단 읽기 실패: %s" % e)
+            log("시청자 수 읽기 실패: %s" % e)
             return None, []
-        names = []
-        for it in _find_key(res.get("get_live_viewing_members", {}), "items") or \
-                _find_key(res.get("get_live_viewing_members", {}), "members") or []:
-            if isinstance(it, dict):
-                names.append(str(it.get("name") or (it.get("member") or {}).get("name") or "?"))
-        cnt = _find_key(res.get("get_live_viewer_count", {}), "viewer_count")
-        if cnt is None:
-            cnt = _find_key(res.get("get_live_viewer_count", {}), "count")
-        return (cnt if cnt is not None else (len(names) or None)), names
+        return (int(n) if n is not None else None), []
 
     def leave(self):
         """라이브 화면에서 밴드 홈으로 나간다(화면이 서버에 시청 종료 quit_live 를 알리게)."""
@@ -998,8 +997,8 @@ class Runner:
         self.set("입장", live_url)
         playing = self._wait_playing(90)
         reg = self.band.registered()
-        reg_text = {True: "서버 시청 등록 확인", False: "서버가 시청 등록을 거절(%s)" % self.band.entered.get("view_live"),
-                    None: "서버 시청 등록은 확인 못 함"}[reg]
+        reg_text = {True: "서버가 방송 입장을 받아 줌", False: "서버가 입장을 거절(%s)" % self.band.entered,
+                    None: "서버 응답은 확인 못 함"}[reg]
         cnt, names = self.band.viewers() if playing else (None, [])
         who = ""
         if cnt is not None or names:
