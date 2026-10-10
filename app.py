@@ -186,10 +186,10 @@ def plan_for(cfg, day):
     return None
 
 
-def hard_end_for(cfg, start):
+def hard_end_for(cfg, start, day=None):
     """상한 시각. 시작이 상한보다 늦거나 바짝 붙은 일정은 시작 3시간 뒤로 잡는다."""
-    hard = hhmm(cfg["hard_end"])
-    return hard if hard > hhmm(start) + dt.timedelta(minutes=30) else hhmm(start) + dt.timedelta(hours=3)
+    hard, begin = hhmm(cfg["hard_end"], day), hhmm(start, day)
+    return hard if hard > begin + dt.timedelta(minutes=30) else begin + dt.timedelta(hours=3)
 
 
 def next_service_date(cfg, today=None):
@@ -879,6 +879,7 @@ class Runner:
                 log("브라우저 닫기 실패: %s" % e)
             self.entered_at = None
             self.set("대기")
+            _wake.set()
 
     def _sleep(self, sec):
         return self.stop_flag.wait(sec)
@@ -1171,41 +1172,72 @@ class Runner:
 runner = Runner()
 
 
+def due_and_next(cfg, st, now, next_try=0.0):
+    """지금 할 일("attend" / "check" / None)과, 다음에 깨어날 시각(없으면 None)을 정한다."""
+    today = now.date().isoformat()
+    due = None
+    plan = plan_for(cfg, now.date())
+    if plan and st.get("last_run_date") != today:
+        start = hhmm(plan[0], now.date())
+        lead = start - dt.timedelta(minutes=int(cfg["lead_min"]))
+        in_window = lead <= now < start + dt.timedelta(minutes=int(cfg["wait_min"]))
+        # 시청 중에 프로그램·서버가 재시작됐으면 상한 시각 전까지는 다시 들어간다
+        resume = st.get("attending_date") == today and lead <= now < hard_end_for(cfg, plan[0], now.date())
+        # 시작 3시간 전쯤 로그인이 살아 있는지 미리 본다
+        precheck = start - dt.timedelta(hours=3) <= now < start - dt.timedelta(hours=2)
+        if in_window or resume:
+            due = "attend" if time.time() >= next_try else None
+        elif precheck and st.get("login_check_date") != today:
+            due = "check"
+    # 다음에 깨어날 시각: 앞으로의 일정마다 '로그인 미리 점검'과 '대기 시작' 두 번
+    times = []
+    for i in range(15):
+        d = now.date() + dt.timedelta(days=i)
+        p = plan_for(cfg, d)
+        if not p or (i == 0 and st.get("last_run_date") == today):
+            continue
+        start = hhmm(p[0], d)
+        times += [start - dt.timedelta(hours=3), start - dt.timedelta(minutes=int(cfg["lead_min"]))]
+    future = [t for t in times if t > now]
+    nxt = min(future) if future else None
+    if next_try > time.time():   # 오류 뒤 재시도 시각
+        retry = now + dt.timedelta(seconds=next_try - time.time())
+        nxt = min(nxt, retry) if nxt else retry
+    return due, nxt
+
+
+_wake = threading.Event()   # 설정이 바뀌거나 작업이 끝나면 스케줄러를 깨워 다시 계산하게 한다
+
+
 def scheduler():
-    mtime = Path(__file__).stat().st_mtime
+    """주기적으로 시계를 보지 않는다. 다음 일정 시각을 계산해 그때까지 잔다."""
     last_clean = 0
     while True:
+        wait = 600
         try:
             HEARTBEAT.write_text(dt.datetime.now().isoformat(timespec="seconds"), encoding="utf-8")
-            now = dt.datetime.now()
-            cfg, st = load_cfg(), load_state()
-            today = now.date().isoformat()
-            if time.time() - last_clean > 6 * 3600:
+            if time.time() - last_clean > 86400:
                 clean_old()
                 last_clean = time.time()
-            if not runner.busy():
-                if Path(__file__).stat().st_mtime != mtime:
-                    log("코드가 바뀌어 스스로 재시작")
-                    subprocess.Popen(["wscript.exe", str(BASE / "scripts" / "start_hidden.vbs")], creationflags=NOWIN)
-                    os._exit(0)
-                plan = plan_for(cfg, now.date())
-                if plan and st.get("last_run_date") != today and time.time() >= runner.next_try:
-                    start = hhmm(plan[0])
-                    lead = start - dt.timedelta(minutes=int(cfg["lead_min"]))
-                    in_window = lead <= now < start + dt.timedelta(minutes=int(cfg["wait_min"]))
-                    # 시청 중에 프로그램·서버가 재시작됐으면 상한 시각 전까지는 다시 들어간다
-                    resume = st.get("attending_date") == today and lead <= now < hard_end_for(cfg, plan[0])
-                    # 시작 3시간 전쯤 로그인이 살아 있는지 미리 본다
-                    precheck = start - dt.timedelta(hours=3) <= now < start - dt.timedelta(hours=2)
-                    if in_window or resume:
-                        log("%s 참석 시작%s" % (plan[1], " (재시작 뒤 이어서)" if resume and not in_window else ""))
-                        runner.start("attend")
-                    elif precheck and st.get("login_check_date") != today:
-                        save_state({"login_check_date": today})
-                        runner.start("check")
+            now = dt.datetime.now()
+            cfg, st = load_cfg(), load_state()
+            if runner.busy():
+                wait = None     # 작업이 끝나면 _guard 가 깨운다
+            else:
+                due, nxt = due_and_next(cfg, st, now, runner.next_try)
+                if due == "check":
+                    save_state({"login_check_date": now.date().isoformat()})
+                if due:
+                    log("%s 시작" % {"attend": "참석", "check": "로그인 미리 점검"}[due])
+                    runner.start(due)
+                    wait = None
+                else:
+                    wait = max(1.0, (nxt - now).total_seconds() + 0.5) if nxt else None
+                    log("다음 깨어날 시각: %s" % (nxt.strftime("%m-%d %H:%M") if nxt else "없음(일정 없음)"))
         except Exception as e:
             log("스케줄러 오류: %r" % e)
-        time.sleep(15)
+        _wake.wait(wait)
+        _wake.clear()
 
 
 # ---------------------------------------------------------------- 관리 화면
@@ -1265,6 +1297,7 @@ def api_config():
             return jsonify({"ok": False, "msg": "밴드 주소(https://www.band.us/band/숫자)를 넣어 주세요"}), 400
         ch["band_no"] = m.group(1)
     cfg = save_cfg(ch)
+    _wake.set()   # 일정이 바뀌었을 수 있으니 다음 깨어날 시각을 다시 계산
     log("설정 변경: %s" % json.dumps(ch, ensure_ascii=False))
     return jsonify({"ok": True, "cfg": cfg})
 
