@@ -387,20 +387,25 @@ JS_FIND_LIVE = r"""
   const ok = h => /\/(band|page)\/\d+\/live\/\d+/.test(h || '');
   const a = [...document.querySelectorAll('a[href*="/live/"]')].find(x => ok(x.href));
   if (a) return {href: a.href, how: 'link'};
-  const bad = e => !!e.closest('[class*="rite"],[class*="reate"],[class*="ost_write"],[class*="Editor"]');
   const vis = e => !!(e.offsetWidth || e.offsetHeight || e.getClientRects().length);
-  const cand = [...document.querySelectorAll('span,em,strong,i,div,a,button')].filter(e => {
-    if (e.children.length > 2 || !vis(e) || bad(e)) return false;
-    const t = (e.textContent || '').replace(/\s+/g, ' ').trim();
-    return /^(LIVE|ON AIR|라이브 중|방송 중|라이브 방송 중)$/i.test(t);
-  });
-  if (!cand.length) return {href: null, how: null};
-  const badge = cand[0];
-  const box = badge.closest('a,button,[role="button"],li,article') || badge.parentElement;
-  document.querySelectorAll('[data-bandlive]').forEach(e => e.removeAttribute('data-bandlive'));
-  box.setAttribute('data-bandlive', '1');
-  return {href: null, how: 'badge', text: (box.textContent || '').replace(/\s+/g, ' ').trim().slice(0, 120),
-          cls: String(box.className).slice(0, 120)};
+  const mark = (box, how) => {
+    document.querySelectorAll('[data-bandlive]').forEach(e => e.removeAttribute('data-bandlive'));
+    box.setAttribute('data-bandlive', '1');
+    return {href: null, how: how, text: (box.textContent || '').replace(/\s+/g, ' ').trim().slice(0, 120),
+            cls: String(box.className).slice(0, 120)};
+  };
+  // 진행 중인 라이브는 밴드 홈의 전용 영역에 카드로 뜬다(없을 땐 빈 div). 2026-10-11 실제 화면에서 확인
+  const region = [...document.querySelectorAll('._groupBandLiveCardRegion,._pageBandLiveCardRegion')]
+    .find(r => r.children.length && vis(r));
+  if (region) return mark(region.querySelector('a,button,[role="button"]') || region.firstElementChild, 'card');
+  // 피드 안의 라이브 딱지. 끝난 방송 글은 liveState 에 -finished 가 붙고 '종료된 LIVE' 라고 나온다 → 제외
+  const st = [...document.querySelectorAll('.liveState')].find(e =>
+    vis(e) && !e.classList.contains('-finished') && !/종료/.test(e.textContent || ''));
+  if (st) {
+    const area = st.closest('.videoArea,.videoSection') || st.parentElement;
+    return mark(area.querySelector('.btnLivePlay') || area, 'feed');
+  }
+  return {href: null, how: null};
 })()
 """
 
@@ -414,8 +419,14 @@ JS_VIDEO = r"""
 (() => {
   const vs = [...document.querySelectorAll('video')];
   const text = %s;
+  const shown = e => !!(e.offsetWidth || e.offsetHeight || e.getClientRects().length);
+  // 밴드 플레이어는 끝나면 .liveMessageBox('라이브 방송이 종료되었습니다.')를 보이고 liveState 에 -finished 를 붙인다
+  const endBox = [...document.querySelectorAll('.liveMessageBox,._liveMessage,.liveState.-finished')]
+    .some(e => shown(e) && /종료/.test(e.textContent || ''));
   const base = {url: location.href, n: vs.length,
-                endText: /(라이브|방송)[^\n]{0,20}(종료|끝났)|종료된\s*(라이브|방송)|(live|broadcast)[^\n]{0,20}ended/i.test(text)};
+                endText: endBox || /(라이브|방송)[^\n]{0,20}(종료|끝났)|종료된\s*(라이브|방송|LIVE)|(live|broadcast)[^\n]{0,20}ended/i.test(text)};
+  // 라이브 화면이 아닌 곳(밴드 홈 피드의 지난 방송 등)의 영상은 절대 틀지 않는다 — 재생한 멤버로 남는다
+  if (!/\/live\/\d+/.test(location.pathname)) return base;
   if (!vs.length) {
     const b = document.querySelector('.btnLivePlay,[class*="btnPlay"],button[aria-label*="재생"]');
     if (b) b.click();

@@ -36,8 +36,18 @@
 - 로그인 안 된 채 `https://www.band.us/feed` → `https://auth.band.us/login?next_url=…` 로 밀려남(실측)
 - 라이브 주소: `/band/:band_no/live/:live_id` (웹 번들 라우트에서 확인). 밴드 정보에 `live_ids` 가 실림
 - 시청 중 표시는 플레이어가 보내는 신호(`live_participating_heartbeat`)라 **영상을 실제로 틀어 놔야** 잡힌다
-- **아직 실제 라이브 화면으로 확인하지 못한 것**: 밴드 홈의 라이브 카드 생김새, 종료 화면 문구,
+- 로그인하면 밴드 홈은 `/band/58221837/post` (세종행복교회, 멤버 146). 2026-10-11 실제 화면에서 확인한 것:
+  - 진행 중 라이브가 뜨는 자리: `._groupBandLiveCardRegion`(없을 땐 빈 div), 페이지형 밴드는 `._pageBandLiveCardRegion`
+  - 끝난 방송 글: `.liveState.-finished` 안에 "종료된 LIVE", 재생 단추 `.btnLivePlay`, 영상 `.liveVideo video`
+  - 종료 안내: `.liveMessageBox ._liveMessage` 의 "라이브 방송이 종료되었습니다."(평소 display:none)
+  - **'LIVE' 글자만으로 찾으면 끝난 방송 글을 집는다**(초판이 실제로 그랬다) → `-finished`·'종료' 제외
+  - 이 밴드는 토요일(안식일 예배)에도 라이브를 한다. 금요일만 들어가는 것은 요일 설정으로 걸러진다
+- **로그인 쿠키는 세션 쿠키로 나온다**(닫으면 삭제). `save_cookies` 가 만료일(180일)을 붙여 다시 심고
+  `C:\H-Secrets\band-live\cookies.json` 에도 보관, 풀려 있으면 `ensure_login` 이 되넣는다.
+  로그인 직후에는 브라우저를 실제로 껐다 켜서 유지되는지 확인한다. 서버가 그 로그인을 며칠 인정하는지는 미확인
+- **아직 진행 중인 라이브로 확인하지 못한 것**: 전용 영역 카드 안쪽 구조(링크인지 단추인지), 라이브 화면의 플레이어,
   웹 시청이 진행자 명단에 뜨는지. 첫 실전 뒤 `data\snapshots` 를 보고 `JS_FIND_LIVE`·`JS_VIDEO` 를 맞출 것
+- 라이브 화면(`/live/번호`)이 아닌 곳의 영상은 틀지 않는다. 피드의 지난 방송을 틀면 "재생한 멤버"로 남는다
 
 ## 수정 시 주의
 - **'라이브 방송' 글자만 보고 누르지 말 것.** 글쓰기 메뉴의 방송 *시작* 단추일 수 있다.
@@ -49,4 +59,5 @@
 
 ## 기밀
 - `C:\H-Secrets\band-live\.env` — `TELEGRAM_BOT_TOKEN`, `TELEGRAM_CHAT_ID` (dreame 과 같은 범용 봇)
-- 밴드 비밀번호는 어디에도 저장하지 않는다. 형님이 로그인 창에서 직접 넣고, 쿠키만 `data\profile` 에 남는다
+- `C:\H-Secrets\band-live\cookies.json` — 밴드·네이버 로그인 쿠키. **계정 열쇠와 같다. git·로그·채팅에 내지 말 것**
+- 밴드 비밀번호는 어디에도 저장하지 않는다. 형님이 로그인 창에서 직접 넣고, 쿠키만 `data\profile` 과 위 파일에 남는다
