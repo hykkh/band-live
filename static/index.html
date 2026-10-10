@@ -35,7 +35,7 @@
   .pill.bad { color:var(--warn); border-color:var(--warn); }
   .grid { display:grid; grid-template-columns:1fr 1fr; gap:10px; }
   label { font-size:13px; color:var(--sub); display:block; }
-  input[type=time], input[type=number], input[type=text], select { width:100%; font:inherit; padding:9px 10px; margin-top:4px; border-radius:8px; border:1px solid var(--line); background:var(--bg); color:var(--ink); }
+  input[type=time], input[type=number], input[type=text], input[type=date], select { width:100%; font:inherit; padding:9px 10px; margin-top:4px; border-radius:8px; border:1px solid var(--line); background:var(--bg); color:var(--ink); }
   ul { list-style:none; margin:0; padding:0; }
   li { padding:6px 0; border-top:1px solid var(--line); font-size:14px; }
   li:first-child { border-top:0; }
@@ -87,6 +87,16 @@
       <label>밴드<input type="text" id="band" placeholder="밴드 주소 또는 번호"></label>
     </div>
     <div class="btns" style="margin-top:12px"><span class="sub" id="bandText"></span><button id="saveBtn">저장</button></div>
+  </section>
+
+  <section>
+    <h2>앞으로 들어갈 일정</h2>
+    <ul id="upcoming"><li class="sub">없습니다</li></ul>
+    <div class="grid" style="margin-top:12px">
+      <label>한 번만 추가 — 날짜<input type="date" id="onceDate"></label>
+      <label>시작 시각<input type="time" id="onceStart" value="19:30"></label>
+    </div>
+    <div class="btns" style="margin-top:10px"><span class="sub">정기 요일과 별개로 그날 한 번만 들어갑니다</span><button id="onceBtn">추가</button></div>
   </section>
 
   <section>
@@ -142,6 +152,11 @@ async function refresh() {
   $('hist').innerHTML = s.history.length ? s.history.map(h =>
     `<li>${h.date} · ${h.kind} · ${h.result}${h.from ? ' (' + h.from + '~' + h.to + ')' : ''}${h.reason ? '<div class="sub">' + h.reason + '</div>' : ''}</li>`).join('')
     : '<li class="sub">아직 없습니다</li>';
+  const once = c.once || [];
+  $('upcoming').innerHTML = s.upcoming.length ? s.upcoming.map(u => {
+    const d = u.slice(0, 10), isOnce = once.some(o => o.date === d);
+    return `<li class="row"><span>${u}</span>${isOnce ? `<button data-del="${d}" style="padding:4px 10px">삭제</button>` : ''}</li>`;
+  }).join('') : '<li class="sub">없습니다</li>';
   const box = $('log'), stick = box.scrollTop + box.clientHeight >= box.scrollHeight - 8;
   box.textContent = s.log.join('\n');
   if (stick) box.scrollTop = box.scrollHeight;
@@ -149,6 +164,15 @@ async function refresh() {
 
 $('enabled').addEventListener('change', e => post('/api/config', {enabled: e.target.checked}));
 $('skipBtn').addEventListener('click', () => post('/api/config', {skip_date: S.next_skipped ? '' : S.next_date}));
+$('onceBtn').addEventListener('click', () => {
+  const d = $('onceDate').value, t = $('onceStart').value;
+  if (!d || !t) { $('msg').textContent = '날짜와 시각을 넣어 주세요'; return; }
+  post('/api/config', {once: (S.cfg.once || []).filter(o => o.date !== d).concat([{date: d, start: t}])});
+});
+$('upcoming').addEventListener('click', e => {
+  const d = e.target.dataset.del;
+  if (d) post('/api/config', {once: (S.cfg.once || []).filter(o => o.date !== d)});
+});
 $('runBtn').addEventListener('click', () => post('/api/do/run'));
 $('stopBtn').addEventListener('click', () => post('/api/do/stop'));
 $('loginBtn').addEventListener('click', () => post('/api/do/login'));

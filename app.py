@@ -50,6 +50,7 @@ DEFAULTS = {
     "skip_date": "",       # 이 날짜(YYYY-MM-DD)는 건너뛴다
     "browser": "edge",     # edge | chrome
     "record": True,        # 화면·구조를 data\snapshots 에 남긴다
+    "once": [],            # 한 번만 들어가는 날 [{"date": "2026-10-13", "start": "19:30"}]
 }
 
 BROWSERS = {
@@ -136,7 +137,7 @@ def add_history(entry):
         write_json(STATE, st)
 
 
-def notify(msg):
+def notify(msg, photo=None):
     log("알림: " + msg.replace("\n", " / "))
     env = {}
     try:
@@ -152,6 +153,14 @@ def notify(msg):
         log("텔레그램 토큰·chat_id 없음")
         return
     try:
+        if photo and Path(photo).exists():
+            with open(photo, "rb") as f:
+                r = requests.post("https://api.telegram.org/bot%s/sendPhoto" % token,
+                                  data={"chat_id": chat, "caption": ("[밴드예배] " + msg)[:1000]},
+                                  files={"photo": f}, timeout=30)
+            if r.status_code == 200:
+                return
+            log("텔레그램 사진 전송 실패: HTTP %s → 글만 보냄" % r.status_code)
         r = requests.post("https://api.telegram.org/bot%s/sendMessage" % token,
                           data={"chat_id": chat, "text": "[밴드예배] " + msg}, timeout=10)
         if r.status_code != 200:
@@ -166,7 +175,25 @@ def hhmm(text, day=None):
     return dt.datetime.combine(day, dt.time(h, m))
 
 
+def plan_for(cfg, day):
+    """그날 들어갈 일정이 있으면 (시작 시각, 종류). 한 번짜리(once)가 정기보다 먼저다."""
+    iso = day.isoformat()
+    for o in cfg.get("once", []):
+        if o.get("date") == iso:
+            return o["start"], "한 번"
+    if cfg["enabled"] and day.weekday() == int(cfg["weekday"]) and cfg.get("skip_date") != iso:
+        return cfg["start"], "정기"
+    return None
+
+
+def hard_end_for(cfg, start):
+    """상한 시각. 시작이 상한보다 늦거나 바짝 붙은 일정은 시작 3시간 뒤로 잡는다."""
+    hard = hhmm(cfg["hard_end"])
+    return hard if hard > hhmm(start) + dt.timedelta(minutes=30) else hhmm(start) + dt.timedelta(hours=3)
+
+
 def next_service_date(cfg, today=None):
+    """다음 정기 예배 날짜(건너뛰기 표시는 화면에서 따로 한다)."""
     today = today or dt.date.today()
     d = today + dt.timedelta(days=(int(cfg["weekday"]) - today.weekday()) % 7)
     if d == today and dt.datetime.now() > hhmm(cfg["start"]) + dt.timedelta(minutes=int(cfg["wait_min"])):
@@ -174,15 +201,79 @@ def next_service_date(cfg, today=None):
     return d
 
 
+def upcoming(cfg, days=14):
+    """앞으로 들어갈 일정 목록 [(날짜, 시작, 종류)]"""
+    out, today, now = [], dt.date.today(), dt.datetime.now()
+    for i in range(days):
+        d = today + dt.timedelta(days=i)
+        p = plan_for(cfg, d)
+        if p and not (i == 0 and now > hhmm(p[0]) + dt.timedelta(minutes=int(cfg["wait_min"]))):
+            out.append((d, p[0], p[1]))
+    return out
+
+
 # ---------------------------------------------------------------- 브라우저(CDP)
 class CdpError(Exception):
     pass
+
+
+# 밴드는 방송이 끝나면 alert('라이브 방송이 종료되었습니다.') 를 띄우고 밴드 홈으로 돌려보낸다(2026-10-11 실측).
+# alert 가 떠 있는 동안은 화면 읽기(Runtime.evaluate)가 통째로 멈추므로, 보이는 대로 닫고 내용을 남겨 둔다.
+DIALOGS = collections.deque(maxlen=20)   # (시각, 내용)
+
+
+def recent_dialog(sec=120):
+    """최근 sec 초 안에 닫은 알림창 내용들"""
+    now = time.time()
+    return [m for t, m in DIALOGS if now - t <= sec]
+
+
+def _guard_tab(page, active):
+    """탭 하나에 연결을 물고 있다가 알림창이 뜨는 즉시 닫는다.
+    알림창이 뜬 '뒤에' 붙은 연결로는 닫을 수 없어서(실측), 미리 물고 있어야 한다."""
+    try:
+        ws = websocket.create_connection(page["webSocketDebuggerUrl"], timeout=10, suppress_origin=True)
+        ws.send(json.dumps({"id": 1, "method": "Page.enable", "params": {}}))
+        n = 1
+        while True:
+            ws.settimeout(60)
+            try:
+                msg = json.loads(ws.recv())
+            except websocket.WebSocketTimeoutException:
+                continue
+            if msg.get("method") == "Page.javascriptDialogOpening":
+                text = msg["params"].get("message", "")
+                DIALOGS.append((time.time(), text))
+                log("알림창 닫음: %s" % text[:100])
+                n += 1
+                ws.send(json.dumps({"id": n, "method": "Page.handleJavaScriptDialog", "params": {"accept": True}}))
+    except Exception:
+        pass   # 탭이나 브라우저가 닫힘
+    finally:
+        active.discard(page["id"])
+
+
+def _guard_loop(browser):
+    active = set()
+    while True:
+        try:
+            for page in browser.pages():
+                if page["id"] not in active and page.get("webSocketDebuggerUrl"):
+                    active.add(page["id"])
+                    threading.Thread(target=_guard_tab, args=(page, active), daemon=True).start()
+        except Exception:
+            pass
+        time.sleep(1)
 
 
 class Tab:
     def __init__(self, ws_url):
         self.ws = websocket.create_connection(ws_url, timeout=10, suppress_origin=True)
         self.n = 0
+        if "/devtools/page/" in ws_url:
+            # 알림창 뜨는 것을 알려 받으려면 필요. 응답은 기다리지 않는다(막힌 탭에서는 응답이 안 온다)
+            self.n += 1
+            self.ws.send(json.dumps({"id": self.n, "method": "Page.enable", "params": {}}))
 
     def close(self):
         try:
@@ -196,10 +287,14 @@ class Tab:
     def __exit__(self, *a):
         self.close()
 
-    def call(self, method, params=None, timeout=15):
+    def _dialog(self, msg):
+        """알림창이 뜨면 닫는다(상시 감시 연결이 먼저 닫았으면 오류 응답이 올 뿐이다)."""
+        if msg.get("method") != "Page.javascriptDialogOpening":
+            return
         self.n += 1
-        mid = self.n
-        self.ws.send(json.dumps({"id": mid, "method": method, "params": params or {}}))
+        self.ws.send(json.dumps({"id": self.n, "method": "Page.handleJavaScriptDialog", "params": {"accept": True}}))
+
+    def _wait(self, mid, method, timeout):
         end = time.time() + timeout
         while time.time() < end:
             self.ws.settimeout(max(0.2, end - time.time()))
@@ -207,13 +302,24 @@ class Tab:
                 msg = json.loads(self.ws.recv())
             except websocket.WebSocketTimeoutException:
                 break
+            self._dialog(msg)
             if msg.get("id") == mid:
                 if "error" in msg:
                     raise CdpError("%s: %s" % (method, msg["error"].get("message")))
                 return msg.get("result", {})
+        return None
+
+
+    def call(self, method, params=None, timeout=15):
+        self.n += 1
+        mid = self.n
+        self.ws.send(json.dumps({"id": mid, "method": method, "params": params or {}}))
+        r = self._wait(mid, method, timeout)
+        if r is not None:
+            return r
         raise CdpError("%s 응답 없음(%d초)" % (method, timeout))
 
-    def js(self, expr, timeout=15):
+    def js(self, expr, timeout=8):
         r = self.call("Runtime.evaluate", {"expression": expr, "returnByValue": True,
                                            "awaitPromise": True, "userGesture": True}, timeout)
         if r.get("exceptionDetails"):
@@ -237,8 +343,32 @@ class Tab:
 
 
 class Browser:
+    _guard_on = False
+
     def __init__(self):
         self.base = "http://127.0.0.1:%d" % CDP_PORT
+
+    def guard(self):
+        if not Browser._guard_on:
+            Browser._guard_on = True
+            threading.Thread(target=_guard_loop, args=(self,), daemon=True).start()
+
+    def unstick(self):
+        """화면 읽기가 안 되는 탭(알림창 등에 막힘)을 닫고 빈 탭을 새로 연다. 닫은 개수를 돌려준다."""
+        closed = 0
+        for page in self.pages():
+            try:
+                with Tab(page["webSocketDebuggerUrl"]) as t:
+                    t.js("1", timeout=4)
+            except Exception:
+                try:
+                    requests.put(self.base + "/json/new?about:blank", timeout=3)
+                    requests.get(self.base + "/json/close/" + page["id"], timeout=3)
+                    closed += 1
+                    log("막힌 탭을 닫고 새로 엶: %s" % page.get("url", "")[:80])
+                except requests.RequestException as e:
+                    log("막힌 탭 닫기 실패: %s" % e)
+        return closed
 
     def exe(self):
         kind = load_cfg().get("browser", "edge")
@@ -254,6 +384,7 @@ class Browser:
             return False
 
     def launch(self, url):
+        self.guard()
         if self.alive():
             return
         PROFILE.mkdir(parents=True, exist_ok=True)
@@ -278,6 +409,10 @@ class Browser:
                 return
             time.sleep(0.5)
         raise RuntimeError("브라우저가 30초 안에 뜨지 않음")
+
+    def settle_guard(self):
+        """새 탭에 감시 연결이 붙을 틈(1초 주기)을 준다."""
+        time.sleep(1.5)
 
     def pages(self):
         try:
@@ -447,6 +582,22 @@ JS_MY_BANDS = r"""
 """
 
 
+def _find_key(obj, key):
+    if isinstance(obj, dict):
+        if key in obj:
+            return obj[key]
+        for v in obj.values():
+            r = _find_key(v, key)
+            if r is not None:
+                return r
+    elif isinstance(obj, list):
+        for v in obj:
+            r = _find_key(v, key)
+            if r is not None:
+                return r
+    return None
+
+
 def is_live_url(url):
     return bool(re.search(r"/(band|page)/\d+/live/\d+", url or ""))
 
@@ -454,10 +605,11 @@ def is_live_url(url):
 class Band:
     def __init__(self, browser):
         self.b = browser
+        self.entered = {}
 
     def snapshot(self, tag):
         if not load_cfg().get("record", True):
-            return
+            return None
         try:
             SNAPS.mkdir(parents=True, exist_ok=True)
             stem = SNAPS / ("%s_%s" % (dt.datetime.now().strftime("%Y%m%d_%H%M%S"), tag))
@@ -467,8 +619,10 @@ class Band:
                 shot = t.call("Page.captureScreenshot", {"format": "jpeg", "quality": 60}, timeout=20)
             stem.with_suffix(".html").write_text("<!-- %s -->\n%s" % (url, html), encoding="utf-8")
             stem.with_suffix(".jpg").write_bytes(base64.b64decode(shot.get("data", "")))
+            return stem.with_suffix(".jpg")
         except Exception as e:
             log("화면 기록 실패(%s): %s" % (tag, e))
+            return None
 
     def logged_in(self):
         """로그인 여부. 로그인 안 된 채 피드를 열면 인증 화면이나 첫 화면으로 밀려난다."""
@@ -520,16 +674,106 @@ class Band:
     def home_url(self):
         return "https://www.band.us/band/%s" % load_cfg()["band_no"]
 
+    def _home_live_ids(self, t):
+        """밴드 홈을 열면서 화면이 받아 오는 밴드 정보(get_band_information)를 엿본다.
+        진행 중인 방송이 있으면 거기 live_ids 에 방송 번호가 실린다(웹 번들의 getOnAirLiveId 가 읽는 값).
+        (방송 번호 목록, 밴드 정보를 읽었는지) 를 돌려준다."""
+        t.call("Network.enable")
+        t.ws.send(json.dumps({"id": 900001, "method": "Page.navigate", "params": {"url": self.home_url()}}))
+        want, done, start = [], set(), time.time()
+        while time.time() - start < 15:
+            t.ws.settimeout(1.0)
+            try:
+                m = json.loads(t.ws.recv())
+            except websocket.WebSocketTimeoutException:
+                m = {}
+            t._dialog(m)
+            if m.get("method") == "Network.responseReceived":
+                if "get_band_information" in m["params"]["response"]["url"]:
+                    want.append(m["params"]["requestId"])
+            elif m.get("method") == "Network.loadingFinished":
+                done.add(m["params"]["requestId"])
+            if time.time() - start >= 5 and any(i in done for i in want):
+                break
+        ids, read = [], False
+        for i in want:
+            try:
+                body = json.loads(t.call("Network.getResponseBody", {"requestId": i}).get("body") or "null")
+            except (CdpError, ValueError):
+                continue  # 사전 요청(OPTIONS)은 본문이 없다
+            if isinstance(body, dict) and body.get("result_data"):
+                read = True
+                ids += [str(x) for x in _find_key(body["result_data"], "live_ids") or []]
+        t.call("Network.disable")
+        return ids, read
+
     def find_live(self):
         with self.b.tab() as t:
-            t.goto(self.home_url())
-            return t.js(JS_FIND_LIVE) or {}
+            try:
+                ids, read = self._home_live_ids(t)
+            except Exception as e:
+                log("밴드 정보 읽기 실패: %s → 화면에서 찾음" % e)
+                t.goto(self.home_url())
+                ids, read = [], False
+            if ids:
+                return {"how": "api", "href": "https://www.band.us/band/%s/live/%s" % (load_cfg()["band_no"], ids[0])}
+            found = t.js(JS_FIND_LIVE) or {}
+            found["api_read"] = read
+            return found
+
+    def _sniff(self, t, keys, sec, url=None, click_js=None):
+        """화면이 서버와 주고받는 응답 중 주소에 keys 가 든 것의 본문을 모은다. {key: 본문(dict)}"""
+        t.call("Network.enable")
+        if url:
+            t.ws.send(json.dumps({"id": 900002, "method": "Page.navigate", "params": {"url": url}}))
+        if click_js:
+            t.ws.send(json.dumps({"id": 900003, "method": "Runtime.evaluate",
+                                  "params": {"expression": click_js, "userGesture": True}}))
+        want, done, start = {}, set(), time.time()
+        while time.time() - start < sec:
+            t.ws.settimeout(0.5)
+            try:
+                m = json.loads(t.ws.recv())
+            except websocket.WebSocketTimeoutException:
+                m = {}
+            t._dialog(m)
+            if m.get("method") == "Network.responseReceived":
+                u = m["params"]["response"]["url"].split("?")[0]
+                for k in keys:
+                    if u.endswith("/" + k):
+                        want[m["params"]["requestId"]] = k
+            elif m.get("method") == "Network.loadingFinished":
+                done.add(m["params"]["requestId"])
+            got = {want[i] for i in want if i in done}
+            if time.time() - start >= 4 and got >= set(keys):
+                break
+        out = {}
+        for i, k in want.items():
+            try:
+                body = json.loads(t.call("Network.getResponseBody", {"requestId": i}).get("body") or "null")
+            except (CdpError, ValueError):
+                continue  # 사전 요청(OPTIONS)은 본문이 없다
+            if isinstance(body, dict):
+                out[k] = body
+        t.call("Network.disable")
+        return out
 
     def enter(self, found):
-        """찾은 라이브로 들어간다. 들어간 주소를 돌려준다(못 들어가면 빈 문자열)."""
+        """찾은 라이브로 들어간다. 들어간 주소를 돌려준다(못 들어가면 빈 문자열).
+        들어갈 때 서버 응답을 엿봐 self.entered 에 남긴다:
+        밴드 웹은 라이브 화면을 열면 get_live(방송 정보) 뒤 view_live(시청 시작 등록)를 부른다(웹 번들에서 확인)."""
+        self.entered = {}
         with self.b.tab() as t:
             if found.get("href"):
-                t.goto(found["href"])
+                try:
+                    res = self._sniff(t, ["get_live", "view_live"], 12, url=found["href"])
+                    self.entered = {k: {"code": v.get("result_code"),
+                                        "msg": (v.get("result_data") or {}).get("message") if isinstance(v.get("result_data"), dict) else None}
+                                    for k, v in res.items()}
+                    log("입장 응답: %s" % json.dumps(self.entered, ensure_ascii=False))
+                except Exception as e:
+                    log("입장 응답 엿보기 실패(%s) → 그냥 엶" % e)
+                    t.goto(found["href"])
             else:
                 if not t.js(JS_CLICK_MARKED):
                     return ""
@@ -545,9 +789,46 @@ class Band:
                 return u
         return ""
 
+    def registered(self):
+        """서버가 시청 등록을 받아 줬는지: True / False / None(확인 못 함)"""
+        v = getattr(self, "entered", {}).get("view_live")
+        return None if v is None else v.get("code") == 1
+
+    def viewers(self):
+        """지금 시청 중인 멤버 명단을 읽어 본다(시청자 수 표시를 눌러 화면이 명단을 받아 오게 한다).
+        (시청자 수, 이름 목록) — 권한이 없거나 화면이 다르면 (None, [])."""
+        click = ("(() => { const e = document.querySelector('[data-viewname=\"DLiveViewerCountView\"]');"
+                 " if (!e) return false; (e.querySelector('a,button') || e).click(); return true; })()")
+        try:
+            with self.b.tab(prefer="/live/") as t:
+                res = self._sniff(t, ["get_live_viewing_members", "get_live_viewer_count"], 6, click_js=click)
+        except Exception as e:
+            log("시청자 명단 읽기 실패: %s" % e)
+            return None, []
+        names = []
+        for it in _find_key(res.get("get_live_viewing_members", {}), "items") or \
+                _find_key(res.get("get_live_viewing_members", {}), "members") or []:
+            if isinstance(it, dict):
+                names.append(str(it.get("name") or (it.get("member") or {}).get("name") or "?"))
+        cnt = _find_key(res.get("get_live_viewer_count", {}), "viewer_count")
+        if cnt is None:
+            cnt = _find_key(res.get("get_live_viewer_count", {}), "count")
+        return (cnt if cnt is not None else (len(names) or None)), names
+
+    def leave(self):
+        """라이브 화면에서 밴드 홈으로 나간다(화면이 서버에 시청 종료 quit_live 를 알리게)."""
+        try:
+            with self.b.tab(prefer="/live/") as t:
+                if is_live_url(t.url()):
+                    t.goto(self.home_url(), settle=2)
+        except Exception as e:
+            log("퇴장 처리 실패: %s" % e)
+
     def video(self):
         with self.b.tab(prefer="/live/") as t:
-            return t.js(JS_VIDEO) or {}
+            v = t.js(JS_VIDEO) or {}
+        v["dialog"] = next((m for m in recent_dialog() if "종료" in m), None)
+        return v
 
 
 # ---------------------------------------------------------------- 참석 진행
@@ -560,6 +841,8 @@ class Runner:
         self.phase = "대기"
         self.detail = ""
         self.entered_at = None
+        self.fails = 0
+        self.next_try = 0
 
     def busy(self):
         return self.thread is not None and self.thread.is_alive()
@@ -648,10 +931,21 @@ class Runner:
     # -- 참석
     def _attend_scheduled(self):
         cfg = load_cfg()
-        today = dt.date.today()
-        save_state({"last_run_date": today.isoformat()})
-        deadline = hhmm(cfg["start"]) + dt.timedelta(minutes=int(cfg["wait_min"]))
-        self._attend(deadline, hhmm(cfg["hard_end"]), "정기")
+        today = dt.date.today().isoformat()
+        start, kind = plan_for(cfg, dt.date.today()) or (cfg["start"], "정기")
+        deadline = hhmm(start) + dt.timedelta(minutes=int(cfg["wait_min"]))
+        if load_state().get("attending_date") == today:  # 시청 중에 재시작된 경우
+            deadline = max(deadline, dt.datetime.now() + dt.timedelta(minutes=10))
+        try:
+            self._attend(deadline, hard_end_for(cfg, start), kind)
+        except Exception:
+            self.fails += 1
+            self.next_try = time.time() + 120
+            if self.fails >= 5:
+                save_state({"last_run_date": today, "attending_date": ""})
+            raise
+        self.fails = 0
+        save_state({"last_run_date": today, "attending_date": ""})
 
     def _attend_manual(self):
         now = dt.datetime.now()
@@ -691,42 +985,95 @@ class Runner:
                 add_history({"date": dt.date.today().isoformat(), "kind": kind, "result": "라이브 없음"})
                 return
             self.set("라이브 대기", "%s 까지" % deadline.strftime("%H:%M"))
-            found = self.band.find_live()
-            if shots == 0:
-                self.band.snapshot("home_waiting")
-                shots = 1
-            if found.get("how"):
-                log("라이브 발견(%s): %s" % (found["how"], found.get("href") or found.get("text")))
-                self.band.snapshot("home_live")
-                live_url = self.band.enter(found)
-                if not live_url:
-                    log("라이브 화면으로 넘어가지 못함 → 다시 시도")
+            live_url, how = self._try_enter(first=(shots == 0))
+            shots = 1
             if not live_url and self._sleep(20):
                 return
 
         # 2) 실제로 재생되는지 확인한다(재생 시간이 늘어나야 인정)
         self.entered_at = dt.datetime.now()
+        if kind != "수동":
+            save_state({"attending_date": dt.date.today().isoformat()})
         self.set("입장", live_url)
         playing = self._wait_playing(90)
-        self.band.snapshot("live_entered")
+        reg = self.band.registered()
+        reg_text = {True: "서버 시청 등록 확인", False: "서버가 시청 등록을 거절(%s)" % self.band.entered.get("view_live"),
+                    None: "서버 시청 등록은 확인 못 함"}[reg]
+        cnt, names = self.band.viewers() if playing else (None, [])
+        who = ""
+        if cnt is not None or names:
+            who = " / 시청자 %s명" % (cnt if cnt is not None else len(names))
+            if names:
+                who += " (%s%s)" % (", ".join(names[:8]), " 외" if len(names) > 8 else "")
+        log("입장 점검: 재생=%s, 등록=%s, 시청자=%s %s" % (playing, reg, cnt, names[:30]))
+        shot = self.band.snapshot("live_entered")
         if playing:
-            notify("예배 라이브 입장 완료 (%s, 무음 재생 확인)" % self.entered_at.strftime("%H:%M"))
+            notify("예배 라이브 입장 완료 (%s) — 무음 재생 확인, %s%s / 찾은 방법: %s" % (
+                self.entered_at.strftime("%H:%M"), reg_text, who, how), shot)
         else:
-            notify("라이브 화면에는 들어갔으나 재생이 확인되지 않습니다. 계속 시도합니다. (%s)" % live_url)
+            notify("라이브 화면에는 들어갔으나 재생이 확인되지 않습니다(%s). 계속 시도합니다. (%s)" % (reg_text, live_url), shot)
 
-        # 3) 끝날 때까지 지킨다
-        reason = self._watch(live_url, hard_end)
+        # 3) 끝날 때까지 지킨다. 끝난 뒤 5분은 방송이 새로 다시 열리는지 본다(끊겼다 재시작하면 방송 번호가 바뀐다)
+        while True:
+            reason = self._watch(live_url, hard_end)
+            if reason.startswith(("수동", "상한")):
+                break
+            self.set("종료 확인", "5분간 방송이 다시 열리는지 봄")
+            live_url, until = "", time.time() + 300
+            while not live_url and time.time() < until and dt.datetime.now() < hard_end:
+                if self._sleep(20):
+                    break
+                live_url, how = self._try_enter()
+            if not live_url:
+                break
+            log("방송이 다시 열려 재입장: %s" % live_url)
+            self._wait_playing(60)
+        if reason.startswith(("수동", "상한")):
+            self.band.leave()
         try:
             self.browser.save_cookies()  # 시청 중 갱신된 쿠키를 닫기 전에 보관
         except Exception as e:
             log("쿠키 보관 실패: %s" % e)
-        mins =int((dt.datetime.now() - self.entered_at).total_seconds() // 60)
-        self.band.snapshot("live_end")
+        mins = int((dt.datetime.now() - self.entered_at).total_seconds() // 60)
+        shot = self.band.snapshot("live_end")
         notify("예배 라이브 종료 — %s~%s (%d분) / 사유: %s" % (
-            self.entered_at.strftime("%H:%M"), dt.datetime.now().strftime("%H:%M"), mins, reason))
+            self.entered_at.strftime("%H:%M"), dt.datetime.now().strftime("%H:%M"), mins, reason), shot)
         add_history({"date": dt.date.today().isoformat(), "kind": kind, "result": "참석 %d분" % mins,
                      "from": self.entered_at.strftime("%H:%M"), "to": dt.datetime.now().strftime("%H:%M"),
                      "reason": reason})
+
+    def _revive(self):
+        """브라우저가 죽었으면 다시 띄우고 로그인을 되살린다."""
+        if self.browser.alive():
+            return
+        log("브라우저가 꺼져 있어 다시 띄움")
+        self.browser.launch("https://www.band.us/feed")
+        self.band.ensure_login()
+
+    def _try_enter(self, first=False):
+        """라이브를 찾아 들어가 본다. 통신 오류는 삼키고 다음 차례에 다시 한다. (들어간 주소, 찾은 방법)"""
+        try:
+            self._revive()
+            found = self.band.find_live()
+            if first:
+                self.band.snapshot("home_waiting")
+                log("밴드 정보 읽기: %s" % ("됨" if found.get("api_read") else "안 됨(화면에서만 찾음)"))
+            if not found.get("how"):
+                return "", ""
+            log("라이브 발견(%s): %s" % (found["how"], found.get("href") or found.get("text")))
+            self.band.snapshot("home_live")
+            url = self.band.enter(found)
+            if not url:
+                log("라이브 화면으로 넘어가지 못함 → 다시 시도")
+                self.band.snapshot("enter_failed")
+            return url, found["how"]
+        except Exception as e:
+            log("라이브 찾기 실패(다시 시도): %r" % e)
+            try:
+                self.browser.unstick()
+            except Exception:
+                pass
+            return "", ""
 
     def _wait_playing(self, sec):
         first, end = None, time.time() + sec
@@ -747,22 +1094,42 @@ class Runner:
         """종료 판정. 영상이 멈추거나 사라지면 밴드 홈에 라이브가 남아 있는지 두 번 확인한 뒤에만 끈다."""
         last_t, last_move = None, time.time()
         last_shot = time.time()
+        fails = 0
         while True:
             if self._sleep(20):
                 return "수동 중지"
             if dt.datetime.now() >= hard_end:
                 return "상한 시각 %s 도달" % hard_end.strftime("%H:%M")
+            died = not self.browser.alive()
+            if died:
+                try:
+                    self._revive()
+                except Exception as e:
+                    log("브라우저 되살리기 실패: %r" % e)
+            stuck = False
             try:
-                v = self.band.video()
+                v = {} if died else self.band.video()
+                fails = 0
             except Exception as e:
                 log("영상 확인 실패: %s" % e)
                 v = {}
+                fails += 1
+                if fails >= 2:
+                    stuck = self.browser.unstick() > 0
+                    fails = 0
             moved = v.get("t") is not None and (last_t is None or v["t"] > last_t + 0.5)
             if moved:
                 last_t, last_move = v["t"], time.time()
                 self.set("시청 중", "재생 %d초째" % int(v["t"]))
             suspect = None
-            if v.get("endText"):
+            if died:
+                suspect = "브라우저가 꺼짐"
+            elif stuck:
+                suspect = "화면이 막혀 탭을 새로 엶"
+            elif v.get("dialog"):
+                suspect = "종료 알림창(%s)" % v["dialog"][:30]
+                DIALOGS.clear()
+            elif v.get("endText"):
                 suspect = "화면에 방송 종료 문구"
             elif v.get("ended"):
                 suspect = "영상이 끝남"
@@ -821,19 +1188,21 @@ def scheduler():
                     log("코드가 바뀌어 스스로 재시작")
                     subprocess.Popen(["wscript.exe", str(BASE / "scripts" / "start_hidden.vbs")], creationflags=NOWIN)
                     os._exit(0)
-                service_day = now.weekday() == int(cfg["weekday"])
-                on = cfg["enabled"] and cfg.get("skip_date") != today
-                start = hhmm(cfg["start"])
-                if service_day and on:
-                    # 낮 12시에 로그인이 살아 있는지 미리 본다
-                    if now.hour == 12 and st.get("login_check_date") != today:
+                plan = plan_for(cfg, now.date())
+                if plan and st.get("last_run_date") != today and time.time() >= runner.next_try:
+                    start = hhmm(plan[0])
+                    lead = start - dt.timedelta(minutes=int(cfg["lead_min"]))
+                    in_window = lead <= now < start + dt.timedelta(minutes=int(cfg["wait_min"]))
+                    # 시청 중에 프로그램·서버가 재시작됐으면 상한 시각 전까지는 다시 들어간다
+                    resume = st.get("attending_date") == today and lead <= now < hard_end_for(cfg, plan[0])
+                    # 시작 3시간 전쯤 로그인이 살아 있는지 미리 본다
+                    precheck = start - dt.timedelta(hours=3) <= now < start - dt.timedelta(hours=2)
+                    if in_window or resume:
+                        log("%s 참석 시작%s" % (plan[1], " (재시작 뒤 이어서)" if resume and not in_window else ""))
+                        runner.start("attend")
+                    elif precheck and st.get("login_check_date") != today:
                         save_state({"login_check_date": today})
                         runner.start("check")
-                    elif (start - dt.timedelta(minutes=int(cfg["lead_min"])) <= now
-                          < start + dt.timedelta(minutes=int(cfg["wait_min"]))
-                          and st.get("last_run_date") != today):
-                        log("정기 참석 시작")
-                        runner.start("attend")
         except Exception as e:
             log("스케줄러 오류: %r" % e)
         time.sleep(15)
@@ -854,6 +1223,7 @@ def api_status():
         "busy": runner.busy(),
         "entered_at": runner.entered_at.strftime("%H:%M") if runner.entered_at else None,
         "next": "%s (%s) %s" % (nxt.isoformat(), WEEKDAYS[nxt.weekday()], cfg["start"]),
+        "upcoming": ["%s (%s) %s · %s" % (d.isoformat(), WEEKDAYS[d.weekday()], st_, k) for d, st_, k in upcoming(cfg)],
         "next_date": nxt.isoformat(), "next_skipped": skip,
         "login_ok": st.get("login_ok"), "login_checked": st.get("login_checked"),
         "history": st.get("history", [])[:8], "log": list(_recent)[-60:],
@@ -878,6 +1248,14 @@ def api_config():
             ch[k] = max(1, min(180, int(body[k])))
     if "skip_date" in body:
         ch["skip_date"] = str(body["skip_date"])
+    if "once" in body:
+        once = []
+        for o in body["once"] or []:
+            if (re.fullmatch(r"\d{4}-\d{2}-\d{2}", str(o.get("date", "")))
+                    and re.fullmatch(r"([01]\d|2[0-3]):[0-5]\d", str(o.get("start", "")))
+                    and o["date"] >= dt.date.today().isoformat()):
+                once.append({"date": o["date"], "start": o["start"]})
+        ch["once"] = sorted(once, key=lambda o: o["date"])[:20]
     if "band_name" in body:
         ch["band_name"] = str(body["band_name"]).strip()
         ch["band_no"] = ""
