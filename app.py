@@ -31,6 +31,7 @@ CONFIG = DATA / "config.json"
 STATE = DATA / "state.json"
 HEARTBEAT = DATA / "heartbeat.txt"
 SECRETS = Path(os.environ.get("H_SECRETS", r"C:\H-Secrets")) / "band-live" / ".env"
+COOKIES = SECRETS.parent / "cookies.json"  # 로그인 쿠키 보관(기밀)
 
 WEB_PORT = 7960
 CDP_PORT = 9460
@@ -309,6 +310,42 @@ class Browser:
                 except requests.RequestException:
                     pass
 
+    # 밴드 로그인 쿠키는 '닫으면 지워지는' 종류로 나온다(2026-10-11 실측: 로그인 확인 뒤 창을 닫으니 풀림).
+    # 그래서 만료일을 붙여 브라우저에 다시 심고, 파일로도 보관했다가 풀려 있으면 되넣는다.
+    def _browser_ws(self):
+        return Tab(requests.get(self.base + "/json/version", timeout=3).json()["webSocketDebuggerUrl"])
+
+    @staticmethod
+    def _cookie_param(c, keep_until):
+        p = {k: c[k] for k in ("name", "value", "domain", "path", "secure", "httpOnly") if k in c}
+        if c.get("sameSite"):
+            p["sameSite"] = c["sameSite"]
+        p["expires"] = keep_until if c.get("session") or c.get("expires", -1) <= 0 else c["expires"]
+        return p
+
+    def save_cookies(self):
+        """로그인된 상태에서만 부를 것. 저장한 개수를 돌려준다."""
+        keep_until = time.time() + 180 * 86400
+        with self._browser_ws() as t:
+            cs = [c for c in t.call("Storage.getCookies")["cookies"]
+                  if "band.us" in c["domain"] or "naver.com" in c["domain"]]
+            params = [self._cookie_param(c, keep_until) for c in cs]
+            t.call("Storage.setCookies", {"cookies": params})
+        COOKIES.parent.mkdir(parents=True, exist_ok=True)
+        tmp = COOKIES.with_suffix(".tmp")
+        tmp.write_text(json.dumps({"saved": dt.datetime.now().isoformat(timespec="seconds"), "cookies": params}),
+                       encoding="utf-8")
+        os.replace(tmp, COOKIES)
+        return len(params)
+
+    def restore_cookies(self):
+        data = read_json(COOKIES, None)
+        if not data or not data.get("cookies"):
+            return 0
+        with self._browser_ws() as t:
+            t.call("Storage.setCookies", {"cookies": data["cookies"]})
+        return len(data["cookies"])
+
     def close(self):
         """이 프로그램이 띄운 브라우저만 닫는다(디버깅 포트를 쥔 프로세스로 특정)."""
         if self.alive():
@@ -435,6 +472,19 @@ class Band:
             return False
         return not (has_login and "/feed" not in url)
 
+    def ensure_login(self):
+        """로그인돼 있으면 쿠키를 갱신 보관하고, 풀려 있으면 보관해 둔 쿠키를 되넣어 본다."""
+        ok = self.logged_in()
+        if not ok and self.b.restore_cookies():
+            log("로그인이 풀려 있어 보관한 쿠키를 되넣음")
+            ok = self.logged_in()
+        if ok:
+            try:
+                self.b.save_cookies()
+            except Exception as e:
+                log("쿠키 보관 실패: %s" % e)
+        return ok
+
     def resolve_band(self):
         cfg = load_cfg()
         if cfg.get("band_no"):
@@ -549,22 +599,33 @@ class Runner:
                 log("로그인 창이 닫힘")
                 return
             urls = [p.get("url", "") for p in self.browser.pages()]
-            if any("band.us" in u and "auth.band.us" not in u and re.search(r"band\.us/(feed|band/|discover|my)", u) for u in urls):
+            if any(re.match(r"https?://(www\.)?band\.us/", u) and "/about/" not in u for u in urls):
                 time.sleep(3)
-                if self.band.logged_in():
+                if self.band.ensure_login():
                     no = self.band.resolve_band()
-                    save_state({"login_ok": True, "login_checked": dt.datetime.now().isoformat(timespec="minutes")})
-                    name = load_cfg()["band_name"]
-                    notify("로그인 확인됨. " + ("%s 밴드 번호 %s" % (name, no) if no
-                                           else "다만 내 밴드 목록에서 '%s' 를 못 찾음 → 관리 화면에 밴드 주소를 넣어 주세요" % name))
                     self.band.snapshot("login_ok")
+                    # 창을 실제로 껐다 켜서 로그인이 남는지까지 본다
+                    self.set("로그인 창", "껐다 켜서 유지되는지 확인 중")
+                    self.browser.close()
+                    time.sleep(2)
+                    self.browser.launch("https://www.band.us/feed")
+                    kept = self.band.ensure_login()
+                    save_state({"login_ok": kept, "login_checked": dt.datetime.now().isoformat(timespec="minutes")})
+                    name = load_cfg()["band_name"]
+                    if kept:
+                        notify("로그인 확인됨(브라우저를 껐다 켜도 유지). " + (
+                            "%s 밴드 번호 %s" % (name, no) if no
+                            else "다만 내 밴드 목록에서 '%s' 를 못 찾음 → 관리 화면에 밴드 주소를 넣어 주세요" % name))
+                    else:
+                        notify("로그인은 됐으나 브라우저를 껐다 켜니 풀립니다. 자동 입장이 안 되는 상태입니다.")
+                        self.band.snapshot("login_not_kept")
                     return
         log("로그인 창 시간 초과 또는 중지")
 
     def _login_check(self):
         self.set("로그인 점검")
         self.browser.launch("https://www.band.us/feed")
-        ok = self.band.logged_in()
+        ok = self.band.ensure_login()
         if ok:
             self.band.resolve_band()
         save_state({"login_ok": ok, "login_checked": dt.datetime.now().isoformat(timespec="minutes")})
@@ -590,7 +651,7 @@ class Runner:
         self.set("준비", "브라우저 띄우는 중")
         self.browser.launch("https://www.band.us/feed")
         told_login = False
-        while not self.band.logged_in():
+        while not self.band.ensure_login():
             save_state({"login_ok": False})
             if not told_login:
                 notify("로그인이 풀려 있어 들어가지 못하고 있습니다. 관리 화면에서 다시 로그인해 주세요.")
@@ -644,7 +705,11 @@ class Runner:
 
         # 3) 끝날 때까지 지킨다
         reason = self._watch(live_url, hard_end)
-        mins = int((dt.datetime.now() - self.entered_at).total_seconds() // 60)
+        try:
+            self.browser.save_cookies()  # 시청 중 갱신된 쿠키를 닫기 전에 보관
+        except Exception as e:
+            log("쿠키 보관 실패: %s" % e)
+        mins =int((dt.datetime.now() - self.entered_at).total_seconds() // 60)
         self.band.snapshot("live_end")
         notify("예배 라이브 종료 — %s~%s (%d분) / 사유: %s" % (
             self.entered_at.strftime("%H:%M"), dt.datetime.now().strftime("%H:%M"), mins, reason))
