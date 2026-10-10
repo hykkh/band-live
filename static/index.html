@@ -1,0 +1,168 @@
+<!doctype html>
+<html lang="ko">
+<head>
+<meta charset="utf-8">
+<meta name="viewport" content="width=device-width, initial-scale=1">
+<title>밴드 예배 자동 참석</title>
+<style>
+  :root { --bg:#f4f5f7; --card:#fff; --ink:#1c2330; --sub:#6b7484; --line:#e3e6ec; --on:#1f9d55; --off:#9aa3b2; --warn:#c2410c; --accent:#2563eb; }
+  @media (prefers-color-scheme: dark) {
+    :root { --bg:#12151b; --card:#1b2029; --ink:#e8ebf0; --sub:#98a2b3; --line:#2b323e; --on:#34c77b; --off:#5d6675; --warn:#fb923c; --accent:#6ea0ff; }
+  }
+  * { box-sizing: border-box; }
+  body { margin:0; background:var(--bg); color:var(--ink); font:16px/1.5 "Malgun Gothic","맑은 고딕",system-ui,sans-serif; }
+  main { max-width:640px; margin:0 auto; padding:20px 16px 48px; }
+  h1 { font-size:20px; margin:4px 0 16px; display:flex; justify-content:space-between; align-items:baseline; }
+  h1 small { font-size:12px; color:var(--sub); font-weight:400; }
+  section { background:var(--card); border:1px solid var(--line); border-radius:14px; padding:16px; margin-bottom:12px; }
+  h2 { font-size:13px; color:var(--sub); margin:0 0 10px; font-weight:600; }
+  .row { display:flex; align-items:center; justify-content:space-between; gap:12px; }
+  .big { font-size:22px; font-weight:700; }
+  .sub { color:var(--sub); font-size:13px; }
+  .sw { position:relative; width:64px; height:36px; flex:none; }
+  .sw input { opacity:0; width:100%; height:100%; margin:0; position:absolute; cursor:pointer; z-index:1; }
+  .sw span { position:absolute; inset:0; background:var(--off); border-radius:18px; transition:.2s; }
+  .sw span::after { content:""; position:absolute; left:4px; top:4px; width:28px; height:28px; background:#fff; border-radius:50%; transition:.2s; }
+  .sw input:checked + span { background:var(--on); }
+  .sw input:checked + span::after { left:32px; }
+  .sw input:focus-visible + span { outline:2px solid var(--accent); outline-offset:2px; }
+  .btns { display:grid; grid-template-columns:1fr 1fr; gap:8px; }
+  button { font:inherit; padding:12px 10px; border-radius:10px; border:1px solid var(--line); background:var(--card); color:var(--ink); cursor:pointer; }
+  button.pri { background:var(--accent); border-color:var(--accent); color:#fff; }
+  button:disabled { opacity:.45; cursor:default; }
+  .pill { display:inline-block; padding:2px 10px; border-radius:999px; font-size:13px; border:1px solid var(--line); }
+  .pill.ok { color:var(--on); border-color:var(--on); }
+  .pill.bad { color:var(--warn); border-color:var(--warn); }
+  .grid { display:grid; grid-template-columns:1fr 1fr; gap:10px; }
+  label { font-size:13px; color:var(--sub); display:block; }
+  input[type=time], input[type=number], input[type=text], select { width:100%; font:inherit; padding:9px 10px; margin-top:4px; border-radius:8px; border:1px solid var(--line); background:var(--bg); color:var(--ink); }
+  ul { list-style:none; margin:0; padding:0; }
+  li { padding:6px 0; border-top:1px solid var(--line); font-size:14px; }
+  li:first-child { border-top:0; }
+  pre { margin:0; font:12px/1.5 Consolas,"Malgun Gothic",monospace; white-space:pre-wrap; word-break:break-all; max-height:260px; overflow:auto; color:var(--sub); }
+  #msg { min-height:20px; font-size:13px; color:var(--accent); margin-top:8px; }
+</style>
+</head>
+<body>
+<main>
+  <h1>밴드 예배 자동 참석 <small id="ver"></small></h1>
+
+  <section>
+    <div class="row">
+      <div>
+        <div class="big" id="onText">…</div>
+        <div class="sub" id="nextText"></div>
+      </div>
+      <label class="sw" aria-label="자동 참석 켜기/끄기"><input type="checkbox" id="enabled"><span></span></label>
+    </div>
+    <div class="row" style="margin-top:12px">
+      <span class="sub" id="skipText"></span>
+      <button id="skipBtn" style="padding:8px 12px"></button>
+    </div>
+  </section>
+
+  <section>
+    <h2>지금 상태</h2>
+    <div class="row">
+      <div><span class="big" id="phase">…</span> <span class="sub" id="detail"></span></div>
+      <span class="pill" id="login">로그인 ?</span>
+    </div>
+    <div class="btns" style="margin-top:12px">
+      <button class="pri" id="runBtn">지금 들어가기</button>
+      <button id="stopBtn">지금 끄기</button>
+      <button id="loginBtn">로그인 창 열기</button>
+      <button id="checkBtn">로그인 점검</button>
+    </div>
+    <div id="msg"></div>
+  </section>
+
+  <section>
+    <h2>시간 설정</h2>
+    <div class="grid">
+      <label>요일<select id="weekday"></select></label>
+      <label>예배 시작<input type="time" id="start"></label>
+      <label>몇 분 전부터 대기<input type="number" id="lead_min" min="1" max="180"></label>
+      <label>시작 뒤 몇 분까지 기다림<input type="number" id="wait_min" min="1" max="180"></label>
+      <label>무조건 끄는 시각<input type="time" id="hard_end"></label>
+      <label>밴드<input type="text" id="band" placeholder="밴드 주소 또는 번호"></label>
+    </div>
+    <div class="btns" style="margin-top:12px"><span class="sub" id="bandText"></span><button id="saveBtn">저장</button></div>
+  </section>
+
+  <section>
+    <h2>최근 기록</h2>
+    <ul id="hist"><li class="sub">아직 없습니다</li></ul>
+  </section>
+
+  <section>
+    <h2>로그</h2>
+    <pre id="log"></pre>
+  </section>
+</main>
+<script>
+const $ = id => document.getElementById(id);
+const DAYS = ['월','화','수','목','금','토','일'];
+$('weekday').innerHTML = DAYS.map((d, i) => `<option value="${i}">${d}요일</option>`).join('');
+let S = null, dirty = false;
+['weekday','start','lead_min','wait_min','hard_end','band'].forEach(id => $(id).addEventListener('input', () => dirty = true));
+
+async function post(url, body) {
+  const r = await fetch(url, {method:'POST', headers:{'Content-Type':'application/json'}, body: JSON.stringify(body || {})});
+  const j = await r.json().catch(() => ({}));
+  $('msg').textContent = j.msg || (j.ok ? '저장했습니다' : '실패했습니다');
+  refresh();
+  return j;
+}
+
+async function refresh() {
+  let s;
+  try { s = await (await fetch('/api/status')).json(); } catch (e) { $('phase').textContent = '프로그램 응답 없음'; return; }
+  S = s;
+  const c = s.cfg;
+  $('ver').textContent = 'v' + s.version;
+  $('enabled').checked = c.enabled;
+  $('onText').textContent = c.enabled ? '자동 참석 켜짐' : '자동 참석 꺼짐';
+  $('nextText').textContent = c.enabled ? '다음: ' + s.next : '켜면 ' + s.next + ' 부터 다시 들어갑니다';
+  $('skipText').textContent = s.next_skipped ? s.next_date + ' 은 건너뜁니다' : '';
+  $('skipBtn').textContent = s.next_skipped ? '건너뛰기 취소' : '이번 한 번만 건너뛰기';
+  $('phase').textContent = s.phase;
+  $('detail').textContent = (s.entered_at ? s.entered_at + ' 입장 · ' : '') + (s.detail || '');
+  const lg = $('login');
+  lg.className = 'pill' + (s.login_ok === true ? ' ok' : s.login_ok === false ? ' bad' : '');
+  lg.textContent = s.login_ok === true ? '로그인 정상' : s.login_ok === false ? '로그인 풀림' : '로그인 미확인';
+  lg.title = s.login_checked ? '확인: ' + s.login_checked : '';
+  $('runBtn').disabled = $('loginBtn').disabled = $('checkBtn').disabled = s.busy;
+  $('stopBtn').disabled = !s.busy;
+  if (!dirty) {
+    $('weekday').value = c.weekday; $('start').value = c.start; $('lead_min').value = c.lead_min;
+    $('wait_min').value = c.wait_min; $('hard_end').value = c.hard_end;
+    $('band').value = c.band_no ? 'https://www.band.us/band/' + c.band_no : '';
+  }
+  $('bandText').textContent = c.band_name + (c.band_no ? ' (번호 ' + c.band_no + ')' : ' — 번호 미확인');
+  $('hist').innerHTML = s.history.length ? s.history.map(h =>
+    `<li>${h.date} · ${h.kind} · ${h.result}${h.from ? ' (' + h.from + '~' + h.to + ')' : ''}${h.reason ? '<div class="sub">' + h.reason + '</div>' : ''}</li>`).join('')
+    : '<li class="sub">아직 없습니다</li>';
+  const box = $('log'), stick = box.scrollTop + box.clientHeight >= box.scrollHeight - 8;
+  box.textContent = s.log.join('\n');
+  if (stick) box.scrollTop = box.scrollHeight;
+}
+
+$('enabled').addEventListener('change', e => post('/api/config', {enabled: e.target.checked}));
+$('skipBtn').addEventListener('click', () => post('/api/config', {skip_date: S.next_skipped ? '' : S.next_date}));
+$('runBtn').addEventListener('click', () => post('/api/do/run'));
+$('stopBtn').addEventListener('click', () => post('/api/do/stop'));
+$('loginBtn').addEventListener('click', () => post('/api/do/login'));
+$('checkBtn').addEventListener('click', () => post('/api/do/check'));
+$('saveBtn').addEventListener('click', async () => {
+  const body = {weekday: +$('weekday').value, start: $('start').value, lead_min: +$('lead_min').value,
+                wait_min: +$('wait_min').value, hard_end: $('hard_end').value};
+  const band = $('band').value.trim();
+  if (band && band !== 'https://www.band.us/band/' + S.cfg.band_no) body.band_url = band;
+  dirty = false;
+  await post('/api/config', body);
+});
+refresh();
+setInterval(refresh, 3000);
+</script>
+</body>
+</html>
