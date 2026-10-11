@@ -1234,6 +1234,20 @@ def scheduler():
                 else:
                     wait = max(1.0, (nxt - now).total_seconds() + 0.5) if nxt else None
                     log("다음 깨어날 시각: %s" % (nxt.strftime("%m-%d %H:%M") if nxt else "없음(일정 없음)"))
+            # 안전망: 시작 15분 뒤에도 입장을 못 했으면(대기 중이든, 작업이 멈췄든) 한 번 알린다
+            today = now.date().isoformat()
+            plan = plan_for(cfg, now.date())
+            if plan and st.get("last_run_date") != today:
+                start = hhmm(plan[0], now.date())
+                late_at = start + dt.timedelta(minutes=15)
+                if now < late_at:
+                    left = (late_at - now).total_seconds() + 0.5
+                    wait = left if wait is None else min(wait, left)
+                elif (now < start + dt.timedelta(minutes=int(cfg["wait_min"])) and runner.entered_at is None
+                      and st.get("late_alert_date") != today):
+                    save_state({"late_alert_date": today})
+                    notify("%s 현재 아직 입장하지 못했습니다. 상태: %s %s" % (
+                        now.strftime("%H:%M"), runner.phase, runner.detail))
         except Exception as e:
             log("스케줄러 오류: %r" % e)
         _wake.wait(wait)
