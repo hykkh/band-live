@@ -843,6 +843,7 @@ class Runner:
         self.detail = ""
         self.entered_at = None
         self.max_viewers = 0
+        self.end_told, self.ended_at = False, None
         self.fails = 0
         self.next_try = 0
 
@@ -1013,10 +1014,12 @@ class Runner:
             notify("라이브 화면에는 들어갔으나 재생이 확인되지 않습니다(%s). 계속 시도합니다. (%s)" % (reg_text, live_url), shot)
 
         # 3) 끝날 때까지 지킨다. 끝난 뒤 5분은 방송이 새로 다시 열리는지 본다(끊겼다 재시작하면 방송 번호가 바뀐다)
+        self.end_told, self.ended_at = False, None
         while True:
             reason = self._watch(live_url, hard_end)
             if reason.startswith(("수동", "상한")):
                 break
+            self._end_notice(reason)   # 확실한 신호였다면 _watch 안에서 이미 보냈다
             self.set("종료 확인", "5분간 방송이 다시 열리는지 봄")
             live_url, until = "", time.time() + 300
             while not live_url and time.time() < until and dt.datetime.now() < hard_end:
@@ -1026,20 +1029,37 @@ class Runner:
             if not live_url:
                 break
             log("방송이 다시 열려 재입장: %s" % live_url)
+            self._resumed_notice()
             self._wait_playing(60)
         if reason.startswith(("수동", "상한")):
             self.band.leave()
+        self._end_notice(reason, closing=True)   # 아직 안 보냈을 때만 나간다(수동 중지·상한 시각)
         try:
             self.browser.save_cookies()  # 시청 중 갱신된 쿠키를 닫기 전에 보관
         except Exception as e:
             log("쿠키 보관 실패: %s" % e)
-        mins = int((dt.datetime.now() - self.entered_at).total_seconds() // 60)
-        shot = self.band.snapshot("live_end")
-        notify("예배 라이브 종료 — %s~%s (%d분) / 시청자 최대 %d명(본인 포함) / 사유: %s" % (
-            self.entered_at.strftime("%H:%M"), dt.datetime.now().strftime("%H:%M"), mins, self.max_viewers, reason), shot)
+        mins = int((self.ended_at - self.entered_at).total_seconds() // 60)
+        log("닫음: %s~%s (%d분), 사유: %s" % (self.entered_at.strftime("%H:%M"), self.ended_at.strftime("%H:%M"), mins, reason))
         add_history({"date": dt.date.today().isoformat(), "kind": kind, "result": "참석 %d분" % mins,
-                     "from": self.entered_at.strftime("%H:%M"), "to": dt.datetime.now().strftime("%H:%M"),
+                     "from": self.entered_at.strftime("%H:%M"), "to": self.ended_at.strftime("%H:%M"),
                      "reason": reason})
+
+    def _end_notice(self, why, closing=False):
+        """종료 알림. 종료를 알아챈 순간 한 번만 보낸다(형님 지시 2026-10-11: 닫을 때 말고 끝난 순간에)."""
+        if self.end_told:
+            return
+        self.end_told, self.ended_at = True, dt.datetime.now()
+        mins = int((self.ended_at - self.entered_at).total_seconds() // 60)
+        shot = self.band.snapshot("live_end")
+        tail = "" if closing else "\n(방송이 다시 열리는지 5분 지켜본 뒤 조용히 닫습니다)"
+        notify("예배 라이브 종료 — %s~%s (%d분) / 시청자 최대 %d명(본인 포함) / 사유: %s%s" % (
+            self.entered_at.strftime("%H:%M"), self.ended_at.strftime("%H:%M"), mins, self.max_viewers, why, tail), shot)
+
+    def _resumed_notice(self):
+        """종료를 알린 뒤 방송이 이어지거나 다시 열렸을 때"""
+        if self.end_told:
+            self.end_told = False
+            notify("방송이 다시 이어져 다시 들어갔습니다 (%s)" % dt.datetime.now().strftime("%H:%M"))
 
     def _revive(self):
         """브라우저가 죽었으면 다시 띄우고 로그인을 되살린다."""
@@ -1144,10 +1164,14 @@ class Runner:
             if not suspect:
                 continue
             log("종료 의심: %s → 밴드 홈에서 확인" % suspect)
-            self.band.snapshot("end_suspect")
+            if suspect.startswith(("종료 알림창", "화면에 방송 종료 문구", "영상이 끝남")):
+                self._end_notice(suspect)   # 밴드가 직접 '종료'라고 알린 경우
+            else:
+                self.band.snapshot("end_suspect")
             again = self._recheck()
             if again:
                 log("라이브가 아직 진행 중 → 다시 입장 (%s)" % again)
+                self._resumed_notice()
                 live_url = again
                 last_t, last_move = None, time.time()
                 self._wait_playing(60)
