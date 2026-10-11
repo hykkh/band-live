@@ -560,7 +560,9 @@ JS_VIDEO = r"""
   // 밴드 플레이어는 끝나면 .liveMessageBox('라이브 방송이 종료되었습니다.')를 보이고 liveState 에 -finished 를 붙인다
   const endBox = [...document.querySelectorAll('.liveMessageBox,._liveMessage,.liveState.-finished')]
     .some(e => shown(e) && /종료/.test(e.textContent || ''));
-  const base = {url: location.href, n: vs.length,
+  const vc = document.querySelector('[data-viewname="DLiveViewerCountView"]');
+  const vm = vc && (vc.textContent || '').match(/\d[\d,]*/);
+  const base = {url: location.href, n: vs.length, viewers: vm ? +vm[0].replace(/,/g, '') : null,
                 endText: endBox || /(라이브|방송)[^\n]{0,10}(종료되었|종료됐|끝났습니다)|종료된\s*(라이브|방송|LIVE)|(live|broadcast) (has |is )?ended/i.test(text)};
   // 라이브 화면이 아닌 곳(밴드 홈 피드의 지난 방송 등)의 영상은 절대 틀지 않는다 — 재생한 멤버로 남는다
   if (!/\/live\/\d+/.test(location.pathname)) return base;
@@ -840,6 +842,7 @@ class Runner:
         self.phase = "대기"
         self.detail = ""
         self.entered_at = None
+        self.max_viewers = 0
         self.fails = 0
         self.next_try = 0
 
@@ -999,13 +1002,9 @@ class Runner:
         reg = self.band.registered()
         reg_text = {True: "서버가 방송 입장을 받아 줌", False: "서버가 입장을 거절(%s)" % self.band.entered,
                     None: "서버 응답은 확인 못 함"}[reg]
-        cnt, names = self.band.viewers() if playing else (None, [])
-        who = ""
-        if cnt is not None or names:
-            who = " / 시청자 %s명" % (cnt if cnt is not None else len(names))
-            if names:
-                who += " (%s%s)" % (", ".join(names[:8]), " 외" if len(names) > 8 else "")
-        log("입장 점검: 재생=%s, 등록=%s, 시청자=%s %s" % (playing, reg, cnt, names[:30]))
+        self.max_viewers = 0
+        who = ""   # 시청자 수는 입장 직후엔 아직 0 이라 종료 알림에 최대값으로 싣는다
+        log("입장 점검: 재생=%s, 등록=%s, 응답=%s" % (playing, reg, json.dumps(self.band.entered, ensure_ascii=False)))
         shot = self.band.snapshot("live_entered")
         if playing:
             notify("예배 라이브 입장 완료 (%s) — 무음 재생 확인, %s%s / 찾은 방법: %s" % (
@@ -1036,8 +1035,8 @@ class Runner:
             log("쿠키 보관 실패: %s" % e)
         mins = int((dt.datetime.now() - self.entered_at).total_seconds() // 60)
         shot = self.band.snapshot("live_end")
-        notify("예배 라이브 종료 — %s~%s (%d분) / 사유: %s" % (
-            self.entered_at.strftime("%H:%M"), dt.datetime.now().strftime("%H:%M"), mins, reason), shot)
+        notify("예배 라이브 종료 — %s~%s (%d분) / 시청자 최대 %d명(본인 포함) / 사유: %s" % (
+            self.entered_at.strftime("%H:%M"), dt.datetime.now().strftime("%H:%M"), mins, self.max_viewers, reason), shot)
         add_history({"date": dt.date.today().isoformat(), "kind": kind, "result": "참석 %d분" % mins,
                      "from": self.entered_at.strftime("%H:%M"), "to": dt.datetime.now().strftime("%H:%M"),
                      "reason": reason})
@@ -1117,6 +1116,8 @@ class Runner:
                 if fails >= 2:
                     stuck = self.browser.unstick() > 0
                     fails = 0
+            if v.get("viewers") is not None:   # 시청자 수는 입장 뒤 1분쯤 지나야 반영된다(실측)
+                self.max_viewers = max(self.max_viewers, v["viewers"])
             moved = v.get("t") is not None and (last_t is None or v["t"] > last_t + 0.5)
             if moved:
                 last_t, last_move = v["t"], time.time()
