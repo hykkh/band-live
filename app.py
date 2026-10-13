@@ -584,7 +584,8 @@ JS_VIDEO = r"""
   const q = v.getVideoPlaybackQuality ? v.getVideoPlaybackQuality() : {};
   return Object.assign(base, {t: v.currentTime, paused: v.paused, ended: v.ended, rs: v.readyState,
                               muted: v.muted, w: v.clientWidth, h: v.clientHeight,
-                              frames: q.totalVideoFrames, clickedPlay: clickedPlay});
+                              frames: q.totalVideoFrames, clickedPlay: clickedPlay,
+                              overlay: !!(bigBtn && shown(bigBtn))});
 })()
 """ % JS_TEXT
 
@@ -838,6 +839,8 @@ class Band:
         with self.b.tab(prefer="/live/") as t:
             v = t.js(JS_VIDEO) or {}
         v["dialog"] = next((m for m in recent_dialog() if "종료" in m), None)
+        if v.get("clickedPlay"):
+            log("플레이어가 멈춤 표시라 재생 단추를 누름")
         return v
 
 
@@ -853,6 +856,7 @@ class Runner:
         self.entered_at = None
         self.max_viewers = 0
         self.end_told, self.ended_at = False, None
+        self.play_proof = ""
         self.fails = 0
         self.next_try = 0
 
@@ -1017,8 +1021,8 @@ class Runner:
         log("입장 점검: 재생=%s, 등록=%s, 응답=%s" % (playing, reg, json.dumps(self.band.entered, ensure_ascii=False)))
         shot = self.band.snapshot("live_entered")
         if playing:
-            notify("예배 라이브 입장 완료 (%s) — 무음 재생 확인, %s%s / 찾은 방법: %s" % (
-                self.entered_at.strftime("%H:%M"), reg_text, who, how), shot)
+            notify("예배 라이브 입장 완료 (%s) — 무음 재생 확인(%s), %s%s / 찾은 방법: %s" % (
+                self.entered_at.strftime("%H:%M"), self.play_proof, reg_text, who, how), shot)
         else:
             notify("라이브 화면에는 들어갔으나 재생이 확인되지 않습니다(%s). 계속 시도합니다. (%s)" % (reg_text, live_url), shot)
 
@@ -1104,18 +1108,29 @@ class Runner:
             return "", ""
 
     def _wait_playing(self, sec):
+        """실제로 재생되는지. 재생 시간이 늘고, 화면이 실제로 새로 그려지고, 플레이어의 큰 ▶ 단추가 사라져야 인정한다.
+        (재생 시간만 보면 영상은 도는데 화면에 ▶ 가 덮인 상태를 놓친다 — 2026-10-13 실제로 놓쳤다)"""
         first, end = None, time.time() + sec
+        self.play_proof = ""
         while time.time() < end and not self._sleep(4):
             try:
                 v = self.band.video()
             except Exception as e:
                 log("영상 확인 실패: %s" % e)
                 continue
-            if v.get("n") and v.get("t") is not None:
-                if first is None:
-                    first = v["t"]
-                elif v["t"] > first + 1:
-                    return True
+            if not v.get("n") or v.get("t") is None:
+                continue
+            if first is None:
+                first = v
+                continue
+            dt_sec = v["t"] - first["t"]
+            drawn = None if v.get("frames") is None or first.get("frames") is None else v["frames"] - first["frames"]
+            if dt_sec > 1 and (drawn is None or drawn > 0) and not v.get("overlay") and not v.get("paused"):
+                self.play_proof = "재생 +%.0f초, 화면 %s장 그려짐, ▶ 표시 없음" % (dt_sec, "?" if drawn is None else drawn)
+                log("재생 확인: " + self.play_proof)
+                return True
+        log("재생 확인 실패: 마지막 상태 %s" % (
+            {k: v.get(k) for k in ("t", "paused", "frames", "overlay", "muted")} if first else "영상 없음"))
         return False
 
     def _watch(self, live_url, hard_end):
