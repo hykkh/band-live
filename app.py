@@ -573,9 +573,18 @@ JS_VIDEO = r"""
   }
   const v = vs.sort((x, y) => y.clientWidth * y.clientHeight - x.clientWidth * x.clientHeight)[0];
   v.muted = true;
-  if (v.paused && !v.ended) { const p = v.play(); if (p && p.catch) p.catch(() => {}); }
+  // 밴드 플레이어는 소리 켠 자동 재생이 막히면 '멈춤' 상태로 큰 ▶ 단추를 띄운다. 영상에 직접 play() 를 걸면
+  // 영상은 돌아도 플레이어 표시는 멈춤으로 남아 화면에 ▶ 가 덮인다(2026-10-13 화요일 예배에서 형님이 발견).
+  // → 그 단추가 보이면 그걸 눌러 플레이어 스스로 재생하게 한다. 일시정지 단추는 건드리지 않는다.
+  const big = document.querySelector('.lyVideoLiveWrap [data-viewname="DVideoBigPlaybackButtonView"]');
+  const bigBtn = big && !big.classList.contains('-btnHide') ? big.querySelector('button') : null;
+  let clickedPlay = false;
+  if (bigBtn && shown(bigBtn) && !v.ended) { bigBtn.click(); clickedPlay = true; }
+  else if (v.paused && !v.ended) { const p = v.play(); if (p && p.catch) p.catch(() => {}); }
+  const q = v.getVideoPlaybackQuality ? v.getVideoPlaybackQuality() : {};
   return Object.assign(base, {t: v.currentTime, paused: v.paused, ended: v.ended, rs: v.readyState,
-                              muted: v.muted, w: v.clientWidth, h: v.clientHeight});
+                              muted: v.muted, w: v.clientWidth, h: v.clientHeight,
+                              frames: q.totalVideoFrames, clickedPlay: clickedPlay});
 })()
 """ % JS_TEXT
 
